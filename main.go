@@ -38,13 +38,13 @@ func main() {
 	cfg := Config{
 		maxTaskTries:   4,
 		maxTaskTimeout: 2.0,
-		workersCount:   10,
+		workersCount:   2,
 	}
 	s := NewServer(cfg)
 	go generateTasks(s)
 
 	go func() {
-		time.Sleep(5 * time.Second)
+		time.Sleep(2 * time.Second)
 		s.Stop()
 	}()
 
@@ -65,10 +65,22 @@ func (s *Server) Start() {
 	fmt.Println("Server Starting...")
 
 	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go func() {
+		select {
+		case <-ctx.Done():
+			return
+		case <-s.quitCh:
+			fmt.Println("stoped by quitCh")
+			cancel()
+			return
+		}
+	}()
 
 	s.wg.Add(s.cfg.workersCount)
 	for i := 0; i < s.cfg.workersCount; i++ {
-		go worker(ctx, s)
+		go worker(ctx, s, i)
 	}
 
 	go func() {
@@ -79,8 +91,6 @@ func (s *Server) Start() {
 	for v := range s.resultsCh {
 		fmt.Println(v)
 	}
-
-	cancel()
 }
 
 func (s *Server) Stop() {
@@ -88,21 +98,18 @@ func (s *Server) Stop() {
 	close(s.quitCh)
 }
 
-func worker(ctx context.Context, s *Server) {
+func worker(ctx context.Context, s *Server, workerID int) {
 	defer s.wg.Done()
 
 	for t := range s.tasksCh {
-		ctx, cancel := context.WithTimeout(ctx, time.Duration(s.cfg.maxTaskTimeout)*time.Second)
+		taskCtx, cancel := context.WithTimeout(ctx, time.Duration(s.cfg.maxTaskTimeout)*time.Second)
 
 		select {
-		case <-s.quitCh:
-			fmt.Println("server stoped")
-			// close(s.tasksCh)
-			// close(s.resultsCh)
-			cancel()
+		case <-ctx.Done():
+			fmt.Printf("server stoped, worker %d\n", workerID)
 			return
 		case s.resultsCh <- processTask(t):
-		case <-ctx.Done():
+		case <-taskCtx.Done():
 			for trie := 1; trie <= s.cfg.maxTaskTries && trie <= t.tries; trie++ {
 				t.timeout = -s.cfg.maxTaskTimeout
 
@@ -120,29 +127,42 @@ func worker(ctx context.Context, s *Server) {
 	}
 }
 
-func (s *Server) Submit(task Task) {
-	s.tasksCh <- task
-}
-
 func processTask(task Task) Result {
 	time.Sleep(time.Duration(task.timeout) * time.Second)
 
 	return Result{taskID: task.ID, status: "Sucssess", taskTime: task.timeout}
 }
 
+func (s *Server) Submit(id int) Task {
+	rndTime := 0.5 + rand.Float64()*(6.0-0.5)
+	rndTries := rand.Intn(s.cfg.maxTaskTries-1) + 1
+	return Task{ID: id, timeout: rndTime, tries: rndTries}
+
+}
+
 func generateTasks(s *Server) {
 	wg := sync.WaitGroup{}
-	wg.Add(100)
 	for i := 0; i < 100; i++ {
-		go func(i int) {
-			rndTime := 0.5 + rand.Float64()*(6.0-0.5)
-			rndTries := rand.Intn(s.cfg.maxTaskTries-1) + 1
-			task := Task{ID: i, timeout: rndTime, tries: rndTries}
-			s.Submit(task)
-
-			wg.Done()
-		}(i)
+		select {
+		case <-s.quitCh:
+			fmt.Println("Server stopping, stopping task generation.")
+			wg.Wait() // Дождаться завершения уже запущенных горутин
+			close(s.tasksCh)
+			return
+		default:
+			wg.Add(1)
+			go func(i int) {
+				defer wg.Done()
+				select {
+				case <-s.quitCh:
+					return // завершить горутину, если сервер остановлен
+				case s.tasksCh <- s.Submit(i):
+					fmt.Printf("Task %d submitted\n", i)
+				}
+			}(i)
+		}
 	}
+
 	wg.Wait()
 	close(s.tasksCh)
 }
